@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>iio: dac: m62332 — do v1 ao v4 — MAC0470/5856</title>
+  <link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <span class="prompt">~/mac0470 $</span>
+
+      <p class="subtitle">MAC0470/5856 · Desenvolvimento de Software Livre · Prof. Paulo Meirelles</p>
+    </div>
+  </header>
+
+  <main>
+    <article>
+      <div class="post-header">
+        <a href="../index.html" class="back-link">← voltar para o índice</a>
+        <div class="post-meta">
+          <span class="date">2026-06-27</span>
+          <span class="tag">patch kernel</span>
+        </div>
+        <h1>iio: dac: m62332 — a saga de um patch no kernel, do v1 ao v4</h1>
+      </div>
+
+      <div class="post-content">
+
+        <h2># contexto</h2>
+        <p>
+          Esse post é diferente dos anteriores. Aqui não é mais tutorial: é o relato de
+          mandar um patch de verdade para a <em>linux-iio</em>, levar review do mantenedor,
+          e reenviar a série várias vezes até ela ficar do jeito que a comunidade espera.
+          O alvo foi o driver <code>drivers/iio/dac/m62332.c</code>, um DAC de 8 bits da
+          Mitsubishi. Coisa pequena, mas justamente por ser pequena deu pra focar no
+          <strong>processo</strong> de contribuição em vez de me perder na complexidade do código.
+        </p>
+        <p>
+          A ideia inicial era simples: dar uma limpada nos <code>#include</code> do driver e
+          modernizar o trecho de locking, trocando o velho par
+          <code>mutex_lock()</code>/<code>mutex_unlock()</code> pela macro <code>guard(mutex)</code>,
+          que faz o unlock automático quando o escopo acaba. O que eu não imaginava é quantas
+          versões isso ia levar.
+
+        <h2># v1 — a ingenuidade do "já tá pronto"</h2>
+        <p>
+          No v1 eu fiz tudo de uma vez só: um patch gigante que reordenava header, adicionava
+          e removia include e ainda convertia o locking. Funcionava, compilava, e eu achei que
+          tava ótimo. Estava errado. A primeira lição veio rápido: um commit no kernel precisa
+          fazer <em>uma</em> coisa só. Misturar reordenação de include com mudança de lógica de
+          lock deixa o review difícil — o revisor não consegue olhar o diff e dizer "isso aqui é
+          só cosmético" ou "isso aqui muda comportamento".
+        </p>
+
+        <h2># v2 e v3 — aprendendo a fatiar</h2>
+        <p>
+          Nas versões seguintes comecei a separar as responsabilidades. No v3 a série já estava
+          em dois patches: um cuidando dos headers e outro do <code>guard(mutex)</code>. O patch
+          do lock ficou assim, e é a mudança da qual mais gostei, porque ela some com todo o
+          padrão de <code>goto out</code>:
+        </p>
+        <pre><code><span class="del">-	mutex_lock(&amp;data-&gt;mutex);</span>
+<span class="add">+	guard(mutex)(&amp;data-&gt;mutex);</span>
+
+ 	if (val) {
+ 		res = regulator_enable(data-&gt;vcc);
+ 		if (res)
+<span class="del">-			goto out;</span>
+<span class="add">+			return res;</span>
+ 	}
+
+ 	res = i2c_master_send(client, outbuf, ARRAY_SIZE(outbuf));
+<span class="del">-	if (res &gt;= 0 &amp;&amp; res != ARRAY_SIZE(outbuf))</span>
+<span class="del">-		res = -EIO;</span>
+<span class="del">-	if (res &lt; 0)</span>
+<span class="del">-		goto out;</span>
+<span class="add">+	if (res &lt; 0)</span>
+<span class="add">+		return res;</span>
+<span class="add">+	if (res != ARRAY_SIZE(outbuf))</span>
+<span class="add">+		return -EIO;</span>
+ 	...
+<span class="del">-	mutex_unlock(&amp;data-&gt;mutex);</span>
+ 	return 0;
+<span class="del">-out:</span>
+<span class="del">-	mutex_unlock(&amp;data-&gt;mutex);</span>
+<span class="del">-	return res;</span>
+ }</code></pre>
+        <p>
+          Reparem que, além do <code>guard()</code>, eu aproveitei pra deixar o tratamento de erro
+          do <code>i2c_master_send()</code> em dois <code>return</code> sequenciais em vez daquela
+          condição combinada. Com o lock se soltando sozinho no fim do escopo, o rótulo
+          <code>out:</code> simplesmente deixa de existir. Menos linhas, menos chance de esquecer
+          um unlock.
+        </p>
+
+        <h2># o review do Jonathan</h2>
+        <p>
+          Foi aqui que o processo ficou interessante de verdade. O Jonathan Cameron (mantenedor
+          do IIO) olhou o patch dos headers e pediu três coisas:
+        </p>
+        <p>
+          1. <strong>Separar ainda mais.</strong> O "limpar headers" na real eram duas coisas:
+          reordenar os includes que já existiam, e <em>adicionar/remover</em> includes pelo
+          princípio do <em>include-what-you-use</em> (IWYU). Cada uma merece seu commit.
+        </p>
+        <p>
+          2. <strong>Não usar o <code>device.h</code> como atalho.</strong> A sugestão era trocar
+          o include "guarda-chuva" por uma forward declaration de <code>struct device</code> mais
+          os headers específicos de cada símbolo usado.
+        </p>
+        <p>
+          3. <strong>Incluir o <code>mod_devicetable.h</code></strong>, que é o header esperado em
+          drivers IIO por causa da tabela de IDs do dispositivo.
+        </p>
+
+        <h2># v4 — fatiando de verdade</h2>
+        <p>
+          O v4 nasceu dessa conversa. Virou uma série de três commits, nessa ordem:
+        </p>
+        <pre><code>iio: dac: m62332: Sort header includes alphabetically
+iio: dac: m62332: Clean up header includes
+iio: dac: m62332: Use guard(mutex) for locking</code></pre>
+        <p>
+          O <strong>1/3</strong> é puramente cosmético: só reordena os includes em ordem
+          alfabética dentro de cada grupo, sem adicionar nem tirar nada. É o commit mais "chato"
+          da série, mas é o que torna o 2/3 fácil de revisar — o revisor consegue ver de relance
+          que ali não muda comportamento nenhum.
+        </p>
+        <p>
+          O <strong>2/3</strong> faz o IWYU pra valer: remove o <code>slab.h</code> (que não era
+          usado), e adiciona os headers específicos de cada símbolo que o arquivo realmente toca:
+        </p>
+        <pre><code><span class="add">+#include &lt;linux/array_size.h&gt;</span>   <span class="cmt">/* ARRAY_SIZE */</span>
+<span class="add">+#include &lt;linux/bits.h&gt;</span>         <span class="cmt">/* BIT */</span>
+<span class="add">+#include &lt;linux/mod_devicetable.h&gt;</span> <span class="cmt">/* struct i2c_device_id */</span>
+<span class="add">+#include &lt;linux/mutex.h&gt;</span>        <span class="cmt">/* struct mutex */</span>
+<span class="add">+#include &lt;linux/pm.h&gt;</span>           <span class="cmt">/* DEFINE_SIMPLE_DEV_PM_OPS, pm_sleep_ptr */</span>
+<span class="add">+#include &lt;linux/types.h&gt;</span>        <span class="cmt">/* u8 */</span>
+<span class="del">-#include &lt;linux/slab.h&gt;</span>        <span class="cmt">/* nao era usado */</span></code></pre>
+
+        <h2># a pegadinha do device.h</h2>
+        <p>
+          Essa foi a parte que mais me ensinou. Seguindo o pedido do review, eu tinha tirado o
+          <code>device.h</code> e colocado uma forward declaration:
+        </p>
+        <pre><code><span class="del">struct device;   /* parecia certo... mas não era */</span></code></pre>
+        <p>
+          O problema: forward declaration de <code>struct device</code> só vale quando você usa
+          o tipo <em>como ponteiro</em> e nada mais. Mas o driver chama
+          <code>dev_get_platdata()</code> dentro do <code>probe()</code> — e essa função é
+          declarada <em>só</em> no <code>linux/device.h</code>. Não existe header mais específico
+          pra ela.
+        </p>
+        <pre><code>ret = iio_map_array_register(indio_dev,
+                            dev_get_platdata(&amp;client-&gt;dev));</code></pre>
+        <p>
+          O detalhe traiçoeiro é que <strong>compilava do mesmo jeito</strong>, porque o
+          <code>i2c.h</code> acaba puxando o <code>device.h</code> de forma transitiva. Ou seja:
+          parecia IWYU correto, mas na prática eu estaria me apoiando num include indireto — exatamente
+          o oposto do que o "include what you use" prega. Então a decisão certa foi
+          <strong>manter o <code>device.h</code> explícito</strong> (na posição alfabética) e
+          jogar fora a forward declaration. Lição guardada: "compila" não é prova de que o include
+          está correto.
+        </p>
+        <pre><code> #include &lt;linux/array_size.h&gt;
+ #include &lt;linux/bits.h&gt;
+<span class="add">+#include &lt;linux/device.h&gt;</span>   <span class="cmt">/* dev_get_platdata() mora aqui */</span>
+ #include &lt;linux/err.h&gt;
+ #include &lt;linux/i2c.h&gt;
+ #include &lt;linux/mod_devicetable.h&gt;</code></pre>
+
+        <h2># empacotando a série</h2>
+        <p>
+          Com os três commits prontos, gerei a série com cover letter e gravei o
+          <em>base-commit</em>, que é o que diz pros revisores e pra CI em cima de qual árvore o
+          trabalho se aplica:
+        </p>
+        <pre><code>git format-patch -v4 --cover-letter --base=auto -3 -o v4/</code></pre>
+        <p>
+          Duas coisas que eu não sabia que importavam tanto:
+        </p>
+        <p>
+          <strong>Bisectabilidade.</strong> Cada commit precisa compilar sozinho, senão um
+          <code>git bisect</code> futuro quebra no meio. Dá pra checar isso fazendo o build a cada
+          commit durante um rebase:
+        </p>
+        <pre><code>git rebase --exec 'make drivers/iio/dac/m62332.o' &lt;base&gt;</code></pre>
+        <p>
+          <strong>Threading do email.</strong> Numa série com várias partes, a cover letter (0/3)
+          é a raiz de uma thread nova — sem <code>In-Reply-To</code> — e os patches 1/3, 2/3 e 3/3
+          aninham embaixo dela. O link pra versão anterior vai <em>no texto</em> da cover letter,
+          não no threading. Por isso enviei sem <code>--in-reply-to</code>: a série antiga não deve
+          ficar pendurada na nova.
+        </p>
+        <p>
+          Na cover letter, o changelog do v4 ficou curto e honesto:
+        </p>
+        <pre><code>Changes in v4:
+- Split the include cleanup in two: 1/3 only re-sorts the existing
+  includes; 2/3 does the IWYU add/remove (per Jonathan's review).
+- 2/3: drop the unused slab.h and add the specific headers the file
+  uses (array_size.h, bits.h, mutex.h, pm.h, types.h, mod_devicetable.h).
+- 3/3 (guard(mutex)): unchanged from v3.</code></pre>
+        <p>
+          Detalhe de etiqueta que aprendi: um "looks good" informal do mantenedor <em>não</em> é um
+          <code>Reviewed-by:</code>. Essas tags precisam da permissão explícita da pessoa nomeada,
+          então não saí colando tag de ninguém — só anotei no changelog que o 3/3 não mudou.
+        </p>
+
+        <h2># o bônus: um bug de verdade</h2>
+        <p>
+          Lendo o driver com calma pra fazer a limpeza, acabei tropeçando num bug real, que não
+          tinha nada a ver com cosmético. O <code>m62332_set_value()</code> habilitava o regulador
+          a cada escrita de valor diferente de zero e desabilitava a cada escrita de zero, sem
+          olhar o estado anterior do canal. Como o regulador é <em>reference counted</em>, ir
+          direto de um valor não-nulo pra outro (ex.: 1 → 2) chamava <code>regulator_enable()</code>
+          duas vezes, e um zero depois só desabilitava uma. O contador nunca voltava a zero e o
+          regulador ficava ligado pra sempre.
+        </p>
+        <p>
+          A correção foi só ligar/desligar nas <em>transições</em>, usando o valor antigo
+          guardado pra detectar a borda:
+        </p>
+        <pre><code><span class="del">-	if (val) {</span>
+<span class="add">+	if (val &amp;&amp; !data-&gt;raw[channel]) {</span>
+ 		res = regulator_enable(data-&gt;vcc);
+ 		...
+ 	}
+ 	...
+<span class="del">-	if (!val)</span>
+<span class="add">+	if (!val &amp;&amp; data-&gt;raw[channel])</span>
+ 		regulator_disable(data-&gt;vcc);
+
+<span class="cmt"> 	/* o raw[channel] só é atualizado DEPOIS de checar a borda */</span>
+ 	data-&gt;raw[channel] = val;</code></pre>
+        <p>
+          Esse virou um patch separado, com <code>Fixes:</code> apontando pro commit que introduziu
+          o driver lá em 2015 e <code>Cc: stable</code>, porque é o tipo de coisa que vale
+          backport. Achar o commit culpado foi um exercício de <code>git blame</code> nas linhas
+          do <code>regulator_enable</code>/<code>regulator_disable</code>.
+        </p>
+
+        <h2># o que eu levo disso</h2>
+        <p>
+          Olhando do v1 até o v4, o código mudou pouco — a maior parte do que aprendi foi sobre
+          <em>como</em> contribuir, não sobre C:
+        </p>
+        <p>
+          • Um commit, uma ideia. Separar o cosmético do funcional não é frescura, é o que
+          deixa o review possível.<br/>
+          • "Compila" não valida um include. O IWYU é sobre intenção, não sobre o linker dar certo.<br/>
+          • Bisectabilidade e threading são parte do patch tanto quanto o diff.<br/>
+          • Paciência com review: quatro versões pra uma limpeza parece muito, mas cada rodada
+          deixou a série melhor — e ainda rendeu um bug fix de brinde.
+        </p>
+        <p>
+          No fim, o que parecia um patchzinho de header virou minha melhor aula prática sobre
+          como o kernel realmente funciona como comunidade.
+        </p>
+      </div>
+    </article>
+  </main>
+
+  <footer>
+    <p><a href="https://github.com" target="_blank">github.io</a></p>
+  </footer>
+</body>
+</html>
