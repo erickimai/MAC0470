@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>iio: dac: m62332 — o bugfix do regulador — MAC0470/5856</title>
+  <link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <span class="prompt">~/mac0470 $</span>
+
+      <p class="subtitle">MAC0470/5856 · Desenvolvimento de Software Livre · Prof. Paulo Meirelles</p>
+    </div>
+  </header>
+
+  <main>
+    <article>
+      <div class="post-header">
+        <a href="../index.html" class="back-link">← voltar para o índice</a>
+        <div class="post-meta">
+          <span class="date">2026-07-07</span>
+          <span class="tag">patch kernel</span>
+        </div>
+        <h1>iio: dac: m62332 — o bugfix do regulador: review do Jonathan, v2 e a etiqueta do Reported-by</h1>
+      </div>
+
+      <div class="post-content">
+
+        <h2># contexto</h2>
+        <p>
+          No <a href="patch-m62332.html">post anterior</a> eu contei a saga da série de limpeza
+          do driver <code>drivers/iio/dac/m62332.c</code> (headers + <code>guard(mutex)</code>),
+          do v1 ao v4 — e mencionei, quase de passagem, que no meio do caminho apareceu um bug
+          de verdade: um desbalanceamento no contador de referências do regulador Vcc. Este post
+          é a continuação: o bug ganhou vida própria como patch separado, levou review do
+          Jonathan Cameron, e já está na v2 na lista. De quebra, a série de limpeza também andou
+          (virou v5) e rendeu conversas novas. Vamos por partes.
+        </p>
+
+        <h2># enquanto isso, a série de limpeza chega ao v5</h2>
+        <p>
+          Dia 28/06 mandei o v5 da série de três patches. A novidade dessa rodada foi que
+          apareceram <em>outros</em> revisores além do mantenedor — e isso muda a dinâmica.
+          O Joshua Crofts revisou os três patches e deixou seu
+          <code>Reviewed-by:</code> (dessa vez com a tag explícita, então ela vai junto na
+          próxima versão). Já o Andy Shevchenko olhou o 2/3, o do IWYU, e cutucou exatamente
+          o ponto que tinha me dado trabalho no v4:
+        </p>
+        <pre><code>+#include &lt;linux/device.h&gt;
+
+"And this is for..?"</code></pre>
+        <p>
+          Quem leu o post anterior lembra: o <code>device.h</code> ficou ali porque o driver
+          chama <code>dev_get_platdata()</code>, que só é declarada nesse header. O próprio
+          Joshua respondeu na thread apontando isso, e o Andy fechou com um "Ah, that
+          explains...". Moral da história: se um include explícito gera pergunta no review de
+          <em>duas</em> versões diferentes, talvez o commit message devesse dizer na cara por
+          que ele está ali. Anotado pro v6.
+        </p>
+
+        <h2># o bugfix vira patch próprio (v1)</h2>
+        <p>
+          Dia 30/06 o bug do regulador virou uma submissão separada, com assunto
+          <code>iio: dac: m62332: Fix regulator reference count imbalance</code>. Recapitulando
+          o problema: o <code>m62332_set_value()</code> chamava <code>regulator_enable()</code>
+          em <em>toda</em> escrita de valor não-nulo e <code>regulator_disable()</code> em toda
+          escrita de zero, sem olhar o estado anterior do canal. Como o regulador é
+          <em>reference counted</em>, ir de 1 → 2 enable-ava duas vezes e um zero depois só
+          desabilitava uma. O contador nunca voltava a zero: regulador ligado pra sempre.
+        </p>
+        <p>
+          A correção do v1 era a que mostrei no post passado — agir só nas transições, usando o
+          valor antigo guardado em <code>data-&gt;raw[channel]</code> pra detectar a borda — mais
+          um detalhe novo que entrou nessa versão: <strong>balancear o regulador no caminho de
+          erro</strong>. Se o <code>i2c_master_send()</code> falha depois de um enable, o patch
+          desfaz o enable antes de retornar, senão o contador desbalanceava do mesmo jeito, só
+          que pelo caminho triste.
+        </p>
+        <p>
+          Por ser correção de comportamento, o patch foi com o kit completo de bugfix:
+        </p>
+        <pre><code>Fixes: b87b0c0f81e8 ("iio: add m62332 DAC driver")
+Cc: stable@vger.kernel.org</code></pre>
+        <p>
+          O <code>Fixes:</code> aponta pro commit de 2015 que introduziu o driver (achado via
+          <code>git blame</code> nas linhas do regulador), e o <code>Cc: stable</code> pede o
+          backport pras árvores estáveis — bug de reference counting é exatamente o tipo de
+          coisa que vale levar pra trás.
+        </p>
+
+        <h2># o review do Jonathan</h2>
+        <p>
+          O Jonathan Cameron respondeu com dois pedidos. O primeiro foi de legibilidade: em vez
+          de espalhar as condições de borda inline pelos <code>if</code>s, extrair um par de
+          booleanos locais com nome. A sugestão dele, quase literal:
+        </p>
+        <pre><code><span class="add">+	bool enabling, disabling;</span>
+<span class="add">+</span>
+<span class="add">+	enabling = val &amp;&amp; !data-&gt;raw[channel];</span>
+<span class="add">+	disabling = !val &amp;&amp; data-&gt;raw[channel];</span>
+
+<span class="del">-	if (val &amp;&amp; !data-&gt;raw[channel]) {</span>
+<span class="add">+	if (enabling) {</span>
+ 		res = regulator_enable(data-&gt;vcc);
+ 		...
+ 	}
+ 	...
+<span class="del">-	if (!val &amp;&amp; data-&gt;raw[channel])</span>
+<span class="add">+	if (disabling)</span>
+ 		regulator_disable(data-&gt;vcc);</code></pre>
+        <p>
+          É o tipo de mudança que não altera uma instrução sequer do código gerado, mas
+          transforma o review: <code>if (enabling)</code> se lê sozinho, e o caminho de erro
+          também fica óbvio — "se estava habilitando e deu erro, desabilita".
+        </p>
+        <p>
+          O segundo pedido foi o mais interessante, porque era sobre <strong>crédito</strong>,
+          não sobre código. No v1 eu tinha posto <code>Reported-by: Jonathan Cameron</code>,
+          já que foi numa resposta dele (lá em abril, durante o review da série antiga) que o
+          problema apareceu pra mim. Ele corrigiu: quem flagou o desbalanceamento na verdade
+          foi o <strong>Sashiko</strong>, a ferramenta automática de review que roda sobre os
+          patchsets da lista — ele só tinha repassado o achado. O certo, então, era creditar a
+          ferramenta diretamente, com um <code>Closes:</code> apontando pro registro do report.
+        </p>
+
+        <h2># v2 — booleanos e crédito no lugar certo</h2>
+        <p>
+          O v2 foi dia 03/07, incorporando as duas coisas. O changelog ficou curto:
+        </p>
+        <pre><code>Changes in v2:
+- Use local enabling/disabling booleans for the edge conditions
+  (Jonathan's suggestion).
+- Credit Sashiko directly in Reported-by, with a Closes: link to the
+  report entry, per Jonathan.</code></pre>
+        <p>
+          E o bloco de tags, agora completo:
+        </p>
+        <pre><code>Fixes: b87b0c0f81e8 ("iio: add m62332 DAC driver")
+<span class="add">Reported-by: Sashiko &lt;sashiko-bot@kernel.org&gt;</span>
+<span class="add">Closes: https://sashiko.dev/#/patchset/20260418130322...</span>
+Cc: stable@vger.kernel.org
+Signed-off-by: Erick Henrique &lt;erick.henrique.rodrigues@usp.br&gt;</code></pre>
+        <p>
+          Eu não sabia que <code>Reported-by:</code> podia (e devia) apontar pra um bot. Faz
+          todo sentido: a tag existe pra rastrear <em>de onde veio</em> o conhecimento do bug,
+          e o par <code>Reported-by:</code> + <code>Closes:</code> é o formato que a
+          documentação do kernel pede justamente pra fechar o ciclo — quem olhar o commit no
+          futuro consegue chegar no report original. Crédito é parte do protocolo, não
+          cortesia.
+        </p>
+        <p>
+          Por ser um patch só, dessa vez nem precisou de cover letter: o changelog foi abaixo
+          da linha <code>---</code>, onde ele aparece pros revisores mas não entra no histórico
+          do git. No patchwork o v2 está como <em>New</em> — agora é esperar a próxima rodada.
+        </p>
+
+        <h2># o que eu levo disso</h2>
+        <p>
+          • Bugfix anda separado de limpeza, com <code>Fixes:</code> e <code>Cc: stable</code>
+          — o destino dele (backport) é diferente do destino de um patch cosmético.<br/>
+          • Caminho de erro também conta: balancear o regulador quando o I2C falha era metade
+          do bug que eu quase não vi.<br/>
+          • Booleano com nome bom vale mais que condição esperta inline. Review é sobre leitura.<br/>
+          • <code>Reported-by:</code> vai pra quem achou o bug — mesmo que seja um bot — e o
+          <code>Closes:</code> fecha o rastro. Atribuição no kernel é levada a sério nos dois
+          sentidos: não se cola tag sem permissão, e não se deixa de dar crédito a quem merece.<br/>
+          • Quando dois revisores tropeçam na mesma dúvida (o <code>device.h</code>), o problema
+          não é deles: é o commit message que está devendo contexto.
+        </p>
+        <p>
+          A série de limpeza segue viva rumo ao v6, e o fix do regulador está na fila. Se tudo
+          der certo, a próxima atualização aqui é sobre o patch aplicado na árvore do IIO.
+        </p>
+      </div>
+    </article>
+  </main>
+
+  <footer>
+    <p><a href="https://github.com" target="_blank">github.io</a></p>
+  </footer>
+</body>
+</html>
