@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>iio: dac: m62332 — o fix aplicado e o v6: quando o rebase do patch 3 é um merge de verdade — MAC0470/5856</title>
+  <link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <span class="prompt">~/mac0470 $</span>
+
+      <p class="subtitle">MAC0470/5856 · Desenvolvimento de Software Livre · Prof. Paulo Meirelles</p>
+    </div>
+  </header>
+
+  <main>
+    <article>
+      <div class="post-header">
+        <a href="../index.html" class="back-link">← voltar para o índice</a>
+        <div class="post-meta">
+          <span class="date">2026-07-20</span>
+          <span class="tag">patch kernel</span>
+        </div>
+        <h1>iio: dac: m62332 — o fix aplicado e o v6: quando o rebase do patch 3 é um merge de verdade</h1>
+      </div>
+
+      <div class="post-content">
+
+        <h2># contexto</h2>
+        <p>
+          No <a href="patch-m62332-fix.html">post anterior</a> o bugfix do regulador tinha
+          virado patch próprio, passado pelo review do Jonathan e chegado ao v2 na lista. A
+          novidade agora é boa: o fix <strong>foi aplicado</strong>. Ele entrou na árvore do
+          IIO, na branch <code>fixes-togreg</code>, como o commit
+          <code>iio: dac: m62332: Fix regulator reference count imbalance</code>. E, junto com
+          o aviso do Jonathan de que a série de limpeza ia precisar de rebase, isso desencadeou
+          a parte mais interessante desta rodada: o patch 3 da limpeza — a conversão pra
+          <code>guard(mutex)</code> — teve que ser <em>refeito</em> em cima da função já
+          corrigida. Não foi resolver conflito: foi combinar duas mudanças na mão.
+        </p>
+
+        <h2># o fix aplicado (e o que muda no commit)</h2>
+        <p>
+          Quando um mantenedor aplica seu patch, ele vira um commit de verdade na árvore dele —
+          e alguns detalhes mudam em relação ao que você mandou. Comparando o meu envio com o
+          commit aplicado, duas coisas apareceram: o Jonathan acrescentou o
+          <code>Signed-off-by:</code> dele (o S-o-b de quem aplica é parte da cadeia de custódia
+          do patch) e o bloco de trailers ficou com o crédito no lugar que ele tinha pedido:
+        </p>
+        <pre><code>Fixes: b87b0c0f81e8 ("iio: add m62332 DAC driver")
+<span class="add">Reported-by: Sashiko &lt;sashiko-bot@kernel.org&gt;</span>
+<span class="add">Closes: https://sashiko.dev/#/patchset/20260418130322...</span>
+Cc: stable@vger.kernel.org
+Signed-off-by: Erick Henrique &lt;erick.henrique.rodrigues@usp.br&gt;
+<span class="add">Signed-off-by: Jonathan Cameron &lt;jonathan.cameron@oss.qualcomm.com&gt;</span></code></pre>
+        <p>
+          Detalhe importante de mecânica de árvore: o fix entrou na
+          <code>fixes-togreg</code> (o ramo do <em>ciclo atual</em>, pra correções), enquanto a
+          série de limpeza vive na <code>togreg</code> (o ramo do <em>próximo</em> ciclo). São
+          branches diferentes que só se encontram lá na frente, quando o mantenedor faz o merge.
+          Guarda essa informação, porque ela volta a importar no fim do post.
+        </p>
+
+        <h2># o aviso do Jonathan: "this will need a rebase for at least patch 3"</h2>
+        <p>
+          Com o fix aplicado, a série de limpeza (que estava no v5) ficou desatualizada: ela foi
+          escrita contra a versão <em>antiga</em> do <code>m62332_set_value()</code>. O Jonathan
+          foi direto: vai precisar de rebase, pelo menos no patch 3. E ele estava certíssimo —
+          mas o motivo é mais sutil do que "os arquivos divergiram".
+        </p>
+        <p>
+          Os patches 1 e 2 (a limpeza de headers — ordenar e aplicar IWYU) não encostam na
+          função do regulador, então rebasearam sem um único conflito. O problema mora todo no
+          patch 3.
+        </p>
+
+        <h2># por que o patch 3 não era um conflito mecânico</h2>
+        <p>
+          O patch 3 do v5 troca <code>mutex_lock()/mutex_unlock()</code> por
+          <code>guard(mutex)()</code> e, de quebra, converte os <code>goto out</code> em
+          <code>return</code> direto. Só que ele foi escrito em cima da função <em>antes</em> do
+          fix. Se eu simplesmente reaplicasse aquele diff, o resultado seria este:
+        </p>
+        <pre><code>	if (val) {                          /* voltou o bug: sem checar a borda */
+		res = regulator_enable(data-&gt;vcc);
+		...
+	}
+	res = i2c_master_send(...);
+<span class="del">	if (res &lt; 0)</span>
+<span class="del">		return res;                 /* LEAK: habilitou e nunca desabilita */</span>
+<span class="del">	if (res != ARRAY_SIZE(outbuf))</span>
+<span class="del">		return -EIO;                /* LEAK: idem */</span>
+	data-&gt;raw[channel] = val;
+	if (!val)
+		regulator_disable(data-&gt;vcc);   /* de novo sem checar a borda */</code></pre>
+        <p>
+          Ou seja: um rebase ingênuo <strong>reintroduziria exatamente o bug que o fix acabou de
+          consertar</strong>. Voltava o <code>if (val)</code> sem olhar o estado do canal, e o
+          caminho de erro voltava a retornar sem desfazer o <code>regulator_enable()</code>. É
+          o tipo de regressão silenciosa que passa no build e passa no checkpatch — e chega
+          quietinha na árvore. Por isso o Jonathan chamou de rebase "de verdade": as duas
+          mudanças (o fix e a conversão pra guard) precisam ser <em>fundidas</em>, não empilhadas.
+        </p>
+
+        <h2># a fusão: guard(mutex) por cima da função corrigida</h2>
+        <p>
+          O caminho certo é pegar a função <em>já corrigida</em> — com os booleanos
+          <code>enabling</code>/<code>disabling</code> e o rollback no erro — e só então aplicar
+          a ideia do patch 3: <code>guard(mutex)</code> no lugar do lock manual, e
+          <code>return</code> no lugar do <code>goto out</code>. O <code>guard()</code> solta o
+          mutex sozinho quando a variável sai de escopo, então o label <code>out:</code> e o
+          <code>mutex_unlock()</code> final simplesmente desaparecem:
+        </p>
+        <pre><code> 	outbuf[0] = channel;
+ 	outbuf[1] = val;
+
+<span class="del">-	mutex_lock(&amp;data-&gt;mutex);</span>
+<span class="add">+	guard(mutex)(&amp;data-&gt;mutex);</span>
+
+ 	enabling = val &amp;&amp; !data-&gt;raw[channel];
+ 	disabling = !val &amp;&amp; data-&gt;raw[channel];
+
+ 	if (enabling) {
+ 		res = regulator_enable(data-&gt;vcc);
+ 		if (res)
+<span class="del">-			goto out;</span>
+<span class="add">+			return res;</span>
+ 	}
+
+ 	res = i2c_master_send(client, outbuf, ARRAY_SIZE(outbuf));
+ 	if (res &gt;= 0 &amp;&amp; res != ARRAY_SIZE(outbuf))
+ 		res = -EIO;
+ 	if (res &lt; 0) {
+ 		if (enabling)
+ 			regulator_disable(data-&gt;vcc);
+<span class="del">-		goto out;</span>
+<span class="add">+		return res;</span>
+ 	}
+
+ 	if (disabling)
+ 		regulator_disable(data-&gt;vcc);
+
+ 	data-&gt;raw[channel] = val;
+<span class="del">-</span>
+<span class="del">-	mutex_unlock(&amp;data-&gt;mutex);</span>
+
+ 	return 0;
+<span class="del">-</span>
+<span class="del">-out:</span>
+<span class="del">-	mutex_unlock(&amp;data-&gt;mutex);</span>
+<span class="del">-	return res;</span>
+ }</code></pre>
+        <p>
+          Repara que eu <strong>mantive a condição combinada</strong>
+          <code>if (res &gt;= 0 &amp;&amp; res != ARRAY_SIZE(outbuf))</code> em vez de quebrar em dois
+          <code>return</code> sequenciais como o v5 fazia. O motivo é o rollback: com um único
+          ponto de erro, o <code>regulator_disable()</code> do caminho triste fica em um lugar
+          só. Se eu separasse em dois returns, teria que duplicar o disable — mais linhas pra
+          fazer menos. Isso, aliás, invalidou uma frase do commit message do v5 ("simplify the
+          error handling using sequential early returns"), então reescrevi a descrição do patch 3
+          pra contar o que ele de fato faz agora.
+        </p>
+
+        <h2># a etiqueta que quase escapou: o Reviewed-by do patch 3</h2>
+        <p>
+          Um detalhe fácil de errar no automático: no v5 o Joshua Crofts tinha dado
+          <code>Reviewed-by:</code> nos três patches. Nos patches 1 e 2, que não mudaram uma
+          vírgula no rebase, a tag continua valendo e vai junto. Mas o patch 3 <em>mudou de
+          forma material</em> — o corpo da função é outro agora. Carregar o
+          <code>Reviewed-by:</code> antigo seria colar no código novo um aval que foi dado pro
+          código velho. O certo é <strong>derrubar a tag no patch 3</strong> e deixar o Joshua
+          reconfirmar se quiser, deixando isso claro no changelog do v6. Atribuição no kernel
+          corta pros dois lados: não se remove crédito à toa, mas também não se estende um review
+          pra algo que a pessoa não revisou.
+        </p>
+
+        <h2># build, checkpatch e as invariantes</h2>
+        <p>
+          Fechado o merge, veio o tratamento de sempre: recompilar o módulo (o
+          <code>m62332.o</code> saiu limpo), passar o <code>checkpatch.pl --strict</code> patch a
+          patch (zero erro, zero warning nos três) e reconferir na unha que os caminhos do
+          regulador continuam balanceados depois da conversão — habilitar só na borda de subida,
+          desabilitar só na de descida, desfazer o enable quando o I2C falha, e não mexer no
+          regulador quando o valor não muda. As invariantes seguem de pé; o
+          <code>guard()</code> só troca <em>como</em> o mutex é solto, não <em>quando</em>.
+        </p>
+
+        <h2># a pergunta que vale mandar antes do v6</h2>
+        <p>
+          Sobra uma dúvida de mecânica de árvore que é melhor perguntar do que adivinhar: em cima
+          de qual branch o v6 deve ser baseado? A limpeza normalmente vai pela
+          <code>togreg</code> (próximo ciclo), mas o fix está na <code>fixes-togreg</code> (ciclo
+          atual). Enquanto esses dois ramos não se encontram, basear a limpeza na
+          <code>fixes-togreg</code> pode não ser o que o mantenedor quer — e se eu chutar errado,
+          reba​seio duas vezes. É exatamente o tipo de pergunta de uma linha que mantenedor
+          responde rápido, então vou mandar na própria thread do v5:
+          <em>"Should I rebase v6 on fixes-togreg, or wait until it reaches togreg?"</em>
+        </p>
+
+        <h2># o que eu levo disso</h2>
+        <p>
+          • "Precisa de rebase" nem sempre quer dizer conflito mecânico. Quando o patch foi
+          escrito contra código que depois mudou, rebase pode ser <em>refazer</em> a mudança —
+          e um replay ingênuo regride o que já foi corrigido.<br/>
+          • Regressão que passa no build e no checkpatch é a mais perigosa. Reler as invariantes
+          à mão depois de mexer no fluxo não é paranoia.<br/>
+          • Manter a condição de erro combinada valeu mais que "simplificar" em returns
+          sequenciais — porque o rollback quer um ponto de erro só. Menos linha nem sempre é
+          menos código.<br/>
+          • <code>Reviewed-by:</code> não sobrevive a mudança material do patch. Derrubar a tag
+          é respeito ao revisor, não desfeita.<br/>
+          • Pergunta de árvore (qual branch?) é barata pro mantenedor e cara pra quem chuta.
+          Uma linha na thread economiza um rebase.
+        </p>
+        <p>
+          Com o v6 montado, buildado e checado, o próximo passo é mandar aquela pergunta e, com
+          a resposta, disparar a série. Se der certo, a próxima atualização aqui é a limpeza
+          também aplicada — o m62332 enfim em paz.
+        </p>
+      </div>
+    </article>
+  </main>
+
+  <footer>
+    <p><a href="https://github.com" target="_blank">github.io</a></p>
+  </footer>
+</body>
+</html>
